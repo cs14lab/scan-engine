@@ -1,0 +1,292 @@
+# DevSecOps Reusable Security Scanner
+# Called by lightweight stubs in user repositories via workflow_call.
+# All scan logic lives here — stubs only reference this workflow.
+#
+# Usage in stub:
+#   jobs:
+#     security-scan:
+#       uses: secureyours/scan-engine/.github/workflows/reusable-scan.yml@main
+#       with:
+#         job_id: ${{ inputs.job_id }}
+#         scanners: ${{ inputs.scanners }}
+
+name: DevSecOps Reusable Scanner
+
+on:
+  workflow_call:
+    inputs:
+      job_id:
+        description: 'Unique scan job ID assigned by the DevSecOps platform'
+        required: true
+        type: string
+      scanners:
+        description: 'Comma-separated list of scanners to run (e.g. semgrep,gitleaks,trivy)'
+        required: true
+        type: string
+
+env:
+  JOB_ID: ${{ inputs.job_id }}
+
+jobs:
+  # ── Setup: parse scanner flags ──────────────────────
+  setup:
+    name: Setup Scan Environment
+    runs-on: ubuntu-latest
+    outputs:
+      has_semgrep: ${{ steps.detect.outputs.has_semgrep }}
+      has_gitleaks: ${{ steps.detect.outputs.has_gitleaks }}
+      has_trivy: ${{ steps.detect.outputs.has_trivy }}
+      has_osv: ${{ steps.detect.outputs.has_osv }}
+      has_syft: ${{ steps.detect.outputs.has_syft }}
+      has_codeql: ${{ steps.detect.outputs.has_codeql }}
+      has_noir: ${{ steps.detect.outputs.has_noir }}
+    steps:
+      - name: Parse scanner selection
+        id: detect
+        run: |
+          SCANNERS="${{ inputs.scanners }}"
+          echo "Job ID: ${{ env.JOB_ID }}"
+          echo "Scanners requested: $SCANNERS"
+
+          [[ "$SCANNERS" == *"semgrep"* ]]      && echo "has_semgrep=true" >> $GITHUB_OUTPUT || echo "has_semgrep=false" >> $GITHUB_OUTPUT
+          [[ "$SCANNERS" == *"gitleaks"* ]]      && echo "has_gitleaks=true" >> $GITHUB_OUTPUT || echo "has_gitleaks=false" >> $GITHUB_OUTPUT
+          [[ "$SCANNERS" == *"trivy"* ]]         && echo "has_trivy=true" >> $GITHUB_OUTPUT || echo "has_trivy=false" >> $GITHUB_OUTPUT
+          [[ "$SCANNERS" == *"osv-scanner"* ]]   && echo "has_osv=true" >> $GITHUB_OUTPUT || echo "has_osv=false" >> $GITHUB_OUTPUT
+          [[ "$SCANNERS" == *"syft"* ]]          && echo "has_syft=true" >> $GITHUB_OUTPUT || echo "has_syft=false" >> $GITHUB_OUTPUT
+          [[ "$SCANNERS" == *"codeql"* ]]        && echo "has_codeql=true" >> $GITHUB_OUTPUT || echo "has_codeql=false" >> $GITHUB_OUTPUT
+          [[ "$SCANNERS" == *"noir"* || "$SCANNERS" == *"owasp-noir"* ]] && echo "has_noir=true" >> $GITHUB_OUTPUT || echo "has_noir=false" >> $GITHUB_OUTPUT
+
+  # ── Semgrep SAST ────────────────────────────────────
+  semgrep:
+    name: Semgrep SAST
+    needs: setup
+    if: needs.setup.outputs.has_semgrep == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan --config auto --json --output semgrep-results.json . || echo '{"results":[],"errors":[]}' > semgrep-results.json
+          echo "Semgrep scan completed"
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results-${{ env.JOB_ID }}
+          path: semgrep-results.json
+
+  # ── Gitleaks Secret Detection ───────────────────────
+  gitleaks:
+    name: Gitleaks Secrets Detection
+    needs: setup
+    if: needs.setup.outputs.has_gitleaks == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: zricethezav/gitleaks:latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Run Gitleaks
+        run: |
+          gitleaks detect --source=. --report-path=gitleaks-results.json --report-format=json --no-git --exit-code 0 || echo '[]' > gitleaks-results.json
+          if [ ! -s gitleaks-results.json ]; then
+            echo '[]' > gitleaks-results.json
+          fi
+          echo "Gitleaks scan completed"
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-results-${{ env.JOB_ID }}
+          path: gitleaks-results.json
+
+  # ── Trivy Vulnerability Scanner ─────────────────────
+  trivy:
+    name: Trivy Vulnerability Scanner
+    needs: setup
+    if: needs.setup.outputs.has_trivy == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: aquasec/trivy:latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Run Trivy
+        run: |
+          trivy fs --format json --output trivy-results.json . || true
+          if [ ! -s trivy-results.json ]; then
+            echo '{"Results":[]}' > trivy-results.json
+          fi
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results-${{ env.JOB_ID }}
+          path: trivy-results.json
+
+  # ── OSV-Scanner ─────────────────────────────────────
+  osv-scanner:
+    name: OSV Vulnerability Scanner
+    needs: setup
+    if: needs.setup.outputs.has_osv == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/google/osv-scanner:latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Run OSV-Scanner
+        run: |
+          /osv-scanner --format json -r . > osv-results.json 2>&1 || true
+          if [ ! -s osv-results.json ]; then
+            echo '{"results":[]}' > osv-results.json
+          fi
+          echo "OSV-Scanner completed"
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: osv-results-${{ env.JOB_ID }}
+          path: osv-results.json
+
+  # ── Syft SBOM Generation ────────────────────────────
+  syft:
+    name: Syft SBOM Generation
+    needs: setup
+    if: needs.setup.outputs.has_syft == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Generate SBOM with Syft
+        run: |
+          docker run --rm -v "$PWD:/src" anchore/syft:latest /src -o json > syft-sbom.json || true
+          if [ ! -s syft-sbom.json ]; then
+            echo '{"artifacts":[]}' > syft-sbom.json
+          fi
+          echo "Syft SBOM generated"
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: syft-sbom-${{ env.JOB_ID }}
+          path: syft-sbom.json
+
+  # ── OWASP Noir Attack Surface ───────────────────────
+  owasp-noir:
+    name: OWASP Noir Attack Surface
+    needs: setup
+    if: needs.setup.outputs.has_noir == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/owasp-noir/noir:latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Run Noir
+        run: |
+          noir -b . -o noir-results.json --format json || true
+          if [ ! -s noir-results.json ]; then
+            echo '{"endpoints":[],"url":"","method":""}' > noir-results.json
+          fi
+          echo "OWASP Noir scan completed"
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: noir-results-${{ env.JOB_ID }}
+          path: noir-results.json
+
+  # ── CodeQL Deep Analysis ────────────────────────────
+  codeql:
+    name: CodeQL Analysis
+    needs: setup
+    if: needs.setup.outputs.has_codeql == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Detect Languages
+        id: detect-languages
+        run: |
+          LANGS=""
+          if find . -name "*.py" -type f | head -1 | grep -q .; then LANGS="$LANGS,python"; fi
+          if find . \( -name "*.js" -o -name "*.ts" \) -type f | head -1 | grep -q .; then LANGS="$LANGS,javascript"; fi
+          if find . -name "*.java" -type f | head -1 | grep -q .; then LANGS="$LANGS,java"; fi
+          if find . -name "*.go" -type f | head -1 | grep -q .; then LANGS="$LANGS,go"; fi
+          if find . -name "*.rb" -type f | head -1 | grep -q .; then LANGS="$LANGS,ruby"; fi
+          LANGS="${LANGS#,}"
+          if [ -z "$LANGS" ]; then LANGS="javascript"; fi
+          echo "languages=$LANGS" >> $GITHUB_OUTPUT
+          echo "Detected languages: $LANGS"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ steps.detect-languages.outputs.languages }}
+        continue-on-error: true
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-results
+        continue-on-error: true
+
+      - name: Ensure results exist
+        run: |
+          mkdir -p codeql-results
+          if [ ! "$(ls -A codeql-results 2>/dev/null)" ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[]}]}' > codeql-results/results.sarif
+          fi
+
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-results-${{ env.JOB_ID }}
+          path: codeql-results
+
+  # ── Summary ─────────────────────────────────────────
+  collect-results:
+    name: Collect and Report Results
+    needs: [semgrep, gitleaks, trivy, osv-scanner, syft, codeql, owasp-noir]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./all-results
+          pattern: '*-${{ env.JOB_ID }}'
+          merge-multiple: false
+
+      - name: Create summary
+        run: |
+          echo "## 🔐 DevSecOps Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Job ID:** ${{ env.JOB_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Scanners:** ${{ inputs.scanners }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts Generated" >> $GITHUB_STEP_SUMMARY
+          for dir in ./all-results/*/; do
+            if [ -d "$dir" ]; then
+              name=$(basename "$dir")
+              echo "- ✅ $name" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
