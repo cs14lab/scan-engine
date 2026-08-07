@@ -66,7 +66,7 @@ jobs:
       image: semgrep/semgrep:latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run Semgrep
         run: |
@@ -74,7 +74,7 @@ jobs:
           echo "Semgrep scan completed"
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: semgrep-results-${{ env.JOB_ID }}
           path: semgrep-results.json
@@ -89,7 +89,7 @@ jobs:
       image: zricethezav/gitleaks:latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run Gitleaks
         run: |
@@ -100,7 +100,7 @@ jobs:
           echo "Gitleaks scan completed"
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gitleaks-results-${{ env.JOB_ID }}
           path: gitleaks-results.json
@@ -115,7 +115,7 @@ jobs:
       image: aquasec/trivy:latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run Trivy
         run: |
@@ -125,7 +125,7 @@ jobs:
           fi
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-results-${{ env.JOB_ID }}
           path: trivy-results.json
@@ -140,7 +140,7 @@ jobs:
       image: ghcr.io/google/osv-scanner:latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run OSV-Scanner
         run: |
@@ -151,7 +151,7 @@ jobs:
           echo "OSV-Scanner completed"
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: osv-results-${{ env.JOB_ID }}
           path: osv-results.json
@@ -164,7 +164,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Generate SBOM with Syft
         run: |
@@ -175,7 +175,7 @@ jobs:
           echo "Syft SBOM generated"
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: syft-sbom-${{ env.JOB_ID }}
           path: syft-sbom.json
@@ -190,7 +190,7 @@ jobs:
       image: ghcr.io/owasp-noir/noir:latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Run Noir
         run: |
@@ -201,7 +201,7 @@ jobs:
           echo "OWASP Noir scan completed"
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: noir-results-${{ env.JOB_ID }}
           path: noir-results.json
@@ -217,7 +217,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Detect Languages
         id: detect-languages
@@ -234,17 +234,17 @@ jobs:
           echo "Detected languages: $LANGS"
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: ${{ steps.detect-languages.outputs.languages }}
         continue-on-error: true
 
       - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+        uses: github/codeql-action/autobuild@v4
         continue-on-error: true
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           output: codeql-results
         continue-on-error: true
@@ -257,7 +257,7 @@ jobs:
           fi
 
       - name: Upload Results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: codeql-results-${{ env.JOB_ID }}
           path: codeql-results
@@ -270,7 +270,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all scan artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./all-results
           pattern: '*-${{ env.JOB_ID }}'
