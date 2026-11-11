@@ -73,6 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       engines: ${{ steps.detect.outputs.engines }}
+      commit: ${{ steps.detect.outputs.commit }}
       ts_e1: ${{ steps.detect.outputs.ts_e1 }}
       ts_e2: ${{ steps.detect.outputs.ts_e2 }}
       ts_e3: ${{ steps.detect.outputs.ts_e3 }}
@@ -89,10 +90,16 @@ jobs:
           declare -A ID=([semgrep]=ts-e1 [codeql]=ts-e2 [gitleaks]=ts-e3 [trivy]=ts-e4
                          [osv-scanner]=ts-e5 [osv]=ts-e5 [syft]=ts-e6 [noir]=ts-e7 [owasp-noir]=ts-e7)
           WANT=" "
+          COMMIT=""
           IFS=',' read -ra TOKENS <<< "$SCANNERS"
           for t in "${TOKENS[@]}"; do
             t=$(printf '%s' "$t" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
             [ -n "$t" ] || continue
+            # commit=<sha>: the commit the platform pinned the scan to. Every
+            # job checks it out, so a commit landing on the branch after the
+            # scan started (the platform's own stub update, a push) does not
+            # change what is scanned or the resolution cutoff.
+            if [[ "$t" =~ ^commit=([0-9a-f]{40})$ ]]; then COMMIT=${BASH_REMATCH[1]}; continue; fi
             t=${ID[$t]:-$t}
             WANT="$WANT$t "
           done
@@ -102,8 +109,10 @@ jobs:
             echo "${e//-/_}=$v" >> "$GITHUB_OUTPUT"
           done
           echo "engines=${LIST#,}" >> "$GITHUB_OUTPUT"
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
           echo "Job ID: $JOB_ID"
           echo "Engines: ${LIST#,}"
+          echo "Commit: ${COMMIT:-branch head}"
 
   # ── Dependency resolution for supply chain analysis ─
   # The repository's own runner is the build sandbox: the resolver may run the
@@ -125,6 +134,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           path: src
           persist-credentials: false
 
@@ -158,6 +168,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           path: src
           persist-credentials: false
 
@@ -214,6 +225,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
       - name: Analyse
@@ -241,6 +253,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
       - name: Analyse
@@ -267,6 +280,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
       - name: Analyse
@@ -296,6 +310,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
       - name: Analyse
@@ -322,6 +337,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
       - name: Analyse
@@ -351,6 +367,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
       - name: Detect languages
