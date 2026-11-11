@@ -44,7 +44,7 @@ on:
         description: 'Where the dependency resolver images are published (dep-resolve)'
         required: false
         type: string
-        default: 'ghcr.io/prudhvireddy20'
+        default: 'ghcr.io/cs14lab'
       resolver_tag:
         description: 'Resolver image tag (dep-resolve)'
         required: false
