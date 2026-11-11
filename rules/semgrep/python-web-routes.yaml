@@ -1,0 +1,306 @@
+rules:
+  # Both rules treat a web route handler's own parameters as attacker input:
+  # Flask path variables (`/static/<group>/<filename>`) and FastAPI or
+  # Starlette query and path parameters (`url: str = Query(...)`). The
+  # registry's taint rules start from `flask.request.*` and miss them, though
+  # they come from the URL exactly like `request.args`.
+  #
+  # FastAPI parameters count only when typed as text or a URL: an `int`, a
+  # `bool` or a Pydantic model cannot carry a path or a host. Flask's `<int:x>`
+  # converters cannot be told apart in a pattern, so `int(...)` is a sanitizer.
+
+  # ── CWE-918 ────────────────────────────────────────────────────────
+  - id: route-parameter-to-http-client
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    metadata:
+      cwe: ["CWE-918: Server-Side Request Forgery (SSRF)"]
+      owasp: ["A10:2021 - Server-Side Request Forgery (SSRF)"]
+      category: security
+      confidence: MEDIUM
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+      technology: [flask, fastapi, starlette, aiohttp, httpx, requests]
+      provenance: >-
+        GHSA-55v6-g8pm-pw4c (rembg): a FastAPI query parameter `url` was fetched
+        with an aiohttp session. No registry rule reported it: their SSRF
+        sources are `flask.request.*`, and aiohttp sessions are not sinks.
+      references:
+        - https://github.com/advisories/GHSA-55v6-g8pm-pw4c
+        - https://cwe.mitre.org/data/definitions/918.html
+    message: >-
+      A route parameter is used as the address of an outgoing HTTP request.
+      Anyone who can call this route can make the server fetch internal
+      addresses: cloud metadata (169.254.169.254), admin ports on localhost, or
+      services behind the firewall. Resolve the host and refuse private,
+      loopback and link-local addresses, or only allow known hosts, and do not
+      follow redirects.
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  def $F(..., $P, ...):
+                    ...
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  async def $F(..., $P, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $ROUTE
+              regex: ^(route|get|post|put|patch|delete|api_route)$
+          - pattern-not-inside: |
+              def $F(..., $P: $T, ...):
+                ...
+          - pattern-not-inside: |
+              async def $F(..., $P: $T, ...):
+                ...
+          - focus-metavariable: $P
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  def $F(..., $P: $T, ...):
+                    ...
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  async def $F(..., $P: $T, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $ROUTE
+              regex: ^(route|get|post|put|patch|delete|api_route)$
+          - metavariable-regex:
+              metavariable: $T
+              regex: ^(str|Optional\[str\]|str \| None|AnyUrl|HttpUrl|AnyHttpUrl)$
+          - focus-metavariable: $P
+    pattern-sanitizers:
+      - pattern: int(...)
+      # A lookup by the parameter returns the application's own record, not
+      # the attacker's text: `db.get_book(book_id)`,
+      # `Model.query.filter_by(name=name)`. Not `x.get(...)` here: it is also
+      # how an HTTP client or session sends a request.
+      - patterns:
+          - pattern-either:
+              - pattern: get_object_or_404(...)
+              - pattern: $Q.filter(...)
+              - pattern: $Q.filter_by(...)
+      - patterns:
+          - pattern: $OBJ.$GETTER(...)
+          - metavariable-regex:
+              metavariable: $GETTER
+              regex: ^(get|find|load|lookup|fetch)_\w+$
+      # An allow-list or a strict match that the code acts on.
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: $X in $ALLOWED
+              - pattern: $X not in $ALLOWED
+              - pattern: re.match($RE, $X, ...)
+              - pattern: re.fullmatch($RE, $X, ...)
+              - pattern: $COMPILED.match($X, ...)
+              - pattern: $COMPILED.fullmatch($X, ...)
+              - pattern: $X.isdigit()
+              - pattern: $X.isalnum()
+          - focus-metavariable: $X
+      # A check that raises or aborts: `_validate_url(url)`, `is_safe_url(url)`.
+      - by-side-effect: true
+        patterns:
+          - pattern: $CHECK($X, ...)
+          - metavariable-regex:
+              metavariable: $CHECK
+              regex: (?i)^(.*\.)?_?(validate|is_safe|is_allowed|check|verify|ensure_safe|assert_safe)\w*$
+          - focus-metavariable: $X
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: requests.$M($URL, ...)
+              - pattern: httpx.$M($URL, ...)
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(get|post|put|patch|delete|head|options|stream)$
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern-either:
+              - pattern: requests.request($METHOD, $URL, ...)
+              - pattern: httpx.request($METHOD, $URL, ...)
+          - focus-metavariable: $URL
+      - patterns:
+          - pattern-either:
+              - pattern: urllib.request.urlopen($URL, ...)
+              - pattern: urlopen($URL, ...)
+          - focus-metavariable: $URL
+      # Client objects: an aiohttp or httpx session, a requests Session.
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  async with aiohttp.ClientSession(...) as $S:
+                    ...
+              - pattern-inside: |
+                  async with httpx.AsyncClient(...) as $S:
+                    ...
+              - pattern-inside: |
+                  with httpx.Client(...) as $S:
+                    ...
+              - pattern-inside: |
+                  with requests.Session() as $S:
+                    ...
+              - pattern-inside: |
+                  $S = aiohttp.ClientSession(...)
+                  ...
+              - pattern-inside: |
+                  $S = httpx.$CLIENT(...)
+                  ...
+              - pattern-inside: |
+                  $S = requests.Session()
+                  ...
+          - pattern: $S.$M($URL, ...)
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(get|post|put|patch|delete|head|options|stream)$
+          - focus-metavariable: $URL
+
+  # ── CWE-22 ─────────────────────────────────────────────────────────
+  - id: route-parameter-to-file-path
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    metadata:
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"]
+      owasp: ["A01:2021 - Broken Access Control"]
+      category: security
+      confidence: MEDIUM
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+      technology: [flask, fastapi, starlette]
+      provenance: >-
+        GHSA-9jj8-v89v-xjvw (changedetection.io): a Flask path variable,
+        filtered with `re.sub(r'[^\w.-]+', '', ...)`, which still lets `..`
+        through, became the directory given to `send_from_directory`. No
+        registry rule reported it: their sources are `flask.request.*`, and the
+        directory argument of `send_from_directory` is not a sink.
+      references:
+        - https://github.com/advisories/GHSA-9jj8-v89v-xjvw
+        - https://cwe.mitre.org/data/definitions/22.html
+    message: >-
+      A route parameter reaches a file path. `..` in it walks out of the
+      intended folder and reads or writes any file the server can, including
+      the application's own code and secrets. A regex that removes "unsafe"
+      characters but keeps dots does not help. Use secure_filename or
+      os.path.basename on the name, and for a directory, resolve it and check
+      it is inside the allowed root (Path.resolve().relative_to) or pick it
+      from an allow-list.
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  def $F(..., $P, ...):
+                    ...
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  async def $F(..., $P, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $ROUTE
+              regex: ^(route|get|post|put|patch|delete|api_route)$
+          - pattern-not-inside: |
+              def $F(..., $P: $T, ...):
+                ...
+          - pattern-not-inside: |
+              async def $F(..., $P: $T, ...):
+                ...
+          - focus-metavariable: $P
+      - patterns:
+          - pattern-either:
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  def $F(..., $P: $T, ...):
+                    ...
+              - pattern-inside: |
+                  @$APP.$ROUTE(...)
+                  async def $F(..., $P: $T, ...):
+                    ...
+          - metavariable-regex:
+              metavariable: $ROUTE
+              regex: ^(route|get|post|put|patch|delete|api_route)$
+          - metavariable-regex:
+              metavariable: $T
+              regex: ^(str|Optional\[str\]|str \| None|Path)$
+          - focus-metavariable: $P
+    pattern-sanitizers:
+      - pattern: int(...)
+      - pattern: secure_filename(...)
+      - pattern: os.path.basename(...)
+      - pattern: Path(...).name
+      - pattern: safe_join(...)
+      - pattern: safejoin(...)
+      - pattern: $M.safe_join(...)
+      - pattern: $M.safejoin(...)
+      - pattern: uuid.UUID(...)
+      # A lookup by the parameter returns the application's own record, not
+      # the attacker's text: `watches.get(uuid)`, `db.get_book(book_id)`,
+      # `Model.query.filter_by(name=name)`.
+      - patterns:
+          - pattern-either:
+              - pattern: $D.get(...)
+              - pattern: get_object_or_404(...)
+              - pattern: $Q.filter(...)
+              - pattern: $Q.filter_by(...)
+      - patterns:
+          - pattern: $OBJ.$GETTER(...)
+          - metavariable-regex:
+              metavariable: $GETTER
+              regex: ^(get|find|load|lookup|fetch)_\w+$
+      # An allow-list or a strict match that the code acts on.
+      - by-side-effect: true
+        patterns:
+          - pattern-either:
+              - pattern: $X in $ALLOWED
+              - pattern: $X not in $ALLOWED
+              - pattern: re.match($RE, $X, ...)
+              - pattern: re.fullmatch($RE, $X, ...)
+              - pattern: $COMPILED.match($X, ...)
+              - pattern: $COMPILED.fullmatch($X, ...)
+              - pattern: $X.isdigit()
+              - pattern: $X.isalnum()
+          - focus-metavariable: $X
+      - by-side-effect: true
+        patterns:
+          - pattern: $X.relative_to(...)
+          - focus-metavariable: $X
+      - by-side-effect: true
+        patterns:
+          - pattern: $CHECK($X, ...)
+          - metavariable-regex:
+              metavariable: $CHECK
+              regex: (?i)^(.*\.)?_?(validate|is_safe|is_allowed|check|verify|ensure_safe|assert_safe)\w*$
+          - focus-metavariable: $X
+    pattern-sinks:
+      - pattern: open(...)
+      - pattern: io.open(...)
+      - patterns:
+          - pattern: send_from_directory($DIR, ...)
+          - focus-metavariable: $DIR
+      - patterns:
+          - pattern: flask.send_from_directory($DIR, ...)
+          - focus-metavariable: $DIR
+      - pattern: send_file(...)
+      - pattern: flask.send_file(...)
+      - pattern: FileResponse(...)
+      - patterns:
+          - pattern-either:
+              - pattern: os.$F($P, ...)
+              - pattern: shutil.$F($P, ...)
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^(remove|unlink|rmdir|removedirs|listdir|scandir|copy|copy2|copyfile|copytree|move|rmtree)$
+          - focus-metavariable: $P
+      - patterns:
+          - pattern: $X.$M(...)
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(read_text|read_bytes|write_text|write_bytes|unlink|rmdir|iterdir)$
+          - focus-metavariable: $X

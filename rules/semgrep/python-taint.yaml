@@ -1,0 +1,160 @@
+rules:
+  # ── CWE-22 ─────────────────────────────────────────────────────────
+  - id: uploadfile-filename-to-filesystem-sink
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    metadata:
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"]
+      category: security
+      confidence: HIGH
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+      technology: [fastapi, flask, starlette]
+      provenance: >-
+        Unauthenticated arbitrary file write in a reviewed repository. No engine
+        in the union reported it: the registry rules treat request bodies and
+        query parameters as sources but not the filename field of a multipart
+        upload, which is attacker-controlled in exactly the same way.
+      references:
+        - https://cwe.mitre.org/data/definitions/22.html
+    message: >-
+      UploadFile.filename comes from the client's Content-Disposition header and
+      reaches a filesystem path without sanitization. A filename of
+      "../../app/main.py" writes outside the upload directory — on a route
+      without authentication that is remote code execution as soon as the
+      written file is imported or served. Use Path(name).name, os.path.basename,
+      or werkzeug.utils.secure_filename before joining.
+    pattern-sources:
+      - pattern: $UPLOAD.filename
+      - pattern: $REQ.files[...].filename
+    pattern-sanitizers:
+      - pattern: os.path.basename(...)
+      - pattern: Path(...).name
+      - pattern: secure_filename(...)
+      - pattern: uuid4()
+      - pattern-regex: '\[\s*c\s+for\s+c\s+in\s+.*isalnum\(\)'
+    # os.path.join is not a sink, it is a propagator — taint mode carries the
+    # tainted name through it to whatever actually touches the filesystem.
+    # Listing it as a sink reported the same defect twice, once where the path
+    # was built and once where it was used, and the duplicate is the kind of
+    # thing that makes a reviewer stop trusting the rule.
+    pattern-sinks:
+      - pattern: open(...)
+      - pattern: $P.write_bytes(...)
+      - pattern: $P.write_text(...)
+      - pattern: shutil.copy(...)
+      - pattern: shutil.copyfileobj(...)
+
+  # ── CWE-22 ─────────────────────────────────────────────────────────
+  - id: json-body-field-to-filesystem-sink
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    metadata:
+      cwe: ["CWE-22: Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"]
+      category: security
+      confidence: MEDIUM
+      likelihood: HIGH
+      impact: HIGH
+      subcategory: [vuln]
+      provenance: >-
+        The same defect one layer in: a path taken from a JSON body field rather
+        than from a form upload. Registry taint rules follow request.args and
+        request.form; a dict lookup on a parsed body is not modelled.
+    message: >-
+      A field read out of a request body reaches a filesystem path. Body fields
+      are attacker-controlled exactly like query parameters — parsing JSON does
+      not sanitize anything. Normalize with Path(value).name, or resolve and
+      check the result is inside the intended directory.
+    pattern-sources:
+      - pattern: $BODY.get("$KEY", ...)
+      - pattern: $BODY["$KEY"]
+    pattern-sanitizers:
+      - pattern: os.path.basename(...)
+      - pattern: Path(...).name
+      - pattern: secure_filename(...)
+      - pattern: $P.resolve().relative_to(...)
+    pattern-sinks:
+      - pattern: open(...)
+      - pattern: $P.write_bytes(...)
+      - pattern: $P.write_text(...)
+
+  # ── CWE-798 ────────────────────────────────────────────────────────
+  - id: secret-literal-as-env-default
+    languages: [python]
+    severity: ERROR
+    metadata:
+      cwe: ["CWE-798: Use of Hard-coded Credentials"]
+      category: security
+      confidence: HIGH
+      likelihood: MEDIUM
+      impact: HIGH
+      subcategory: [vuln]
+      provenance: >-
+        A committed JWT signing key in a reviewed repository. Gitleaks missed it
+        because the literal is a function argument rather than an assignment to
+        a secret-named variable, and Semgrep's registry hardcoded-secret rules
+        look at assignment targets. In the same run Gitleaks reported a CTF flag
+        in a markdown file as HIGH.
+    message: >-
+      A secret-shaped literal is the fallback for an environment variable. If
+      the variable is unset in production this committed value is what runs —
+      for a signing key that means anyone with read access to the source can
+      forge tokens, and rotating the key requires a deploy. Fail closed instead:
+      read the variable with no default and raise when it is missing.
+    patterns:
+      - pattern-either:
+          - pattern: os.getenv($NAME, "$VALUE")
+          - pattern: os.environ.get($NAME, "$VALUE")
+          - pattern: config($NAME, default="$VALUE")
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i).*(secret|key|token|password|passwd|pwd|credential|api[_-]?key|private|salt).*
+      # Long enough to be a real secret, and not one of the placeholders that
+      # announce themselves. The point of the rule is the default that silently
+      # works in production, not the one that fails loudly.
+      #
+      # One combined regex with a negative lookahead rather than a separate
+      # `metavariable-pattern` block: $VALUE binds to the *text* of a string
+      # literal, and a metavariable-pattern over a bound string is dropped at
+      # scan time — the rule still validates, still loads, and then matches
+      # nothing, which is the worst of the three outcomes.
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: (?i)^(?!(changeme|change-me|change_me|replace|placeholder|your[-_]|xxx|todo|none|null|example|test|dummy|secret|password|<|\$\{)).{8,}$
+
+  # ── CWE-214 ────────────────────────────────────────────────────────
+  - id: credential-in-process-argv
+    languages: [python]
+    severity: WARNING
+    metadata:
+      cwe: ["CWE-214: Invocation of Process Using Visible Sensitive Information"]
+      category: security
+      confidence: MEDIUM
+      likelihood: MEDIUM
+      impact: MEDIUM
+      subcategory: [vuln]
+      provenance: >-
+        Observed in deployment tooling in a reviewed repository; reported by no
+        engine in the union.
+    message: >-
+      A credential is passed as a command-line argument. Process arguments are
+      world-readable through /proc/<pid>/cmdline to every process in the same
+      container, and they land in shell history and process listings. Use
+      `sshpass -e` with SSHPASS in the environment, MYSQL_PWD or a defaults
+      file, or key-based authentication.
+    # Quoted: Semgrep's list pattern is a *string* containing YAML-looking
+    # syntax. Unquoted, the YAML parser consumes it as a list and the rule is
+    # rejected at load time — which, in a directory loaded with --config, means
+    # the whole file silently contributes nothing.
+    pattern-either:
+      - pattern: '[..., "sshpass", "-p", $PW, ...]'
+      - patterns:
+          - pattern: '[..., "mysql", ..., "-p$PW", ...]'
+      - patterns:
+          - pattern: '[..., "curl", ..., "-u", $CRED, ...]'
+          - metavariable-regex:
+              metavariable: $CRED
+              regex: .*:.+

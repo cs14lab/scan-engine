@@ -1,225 +1,359 @@
-# DevSecOps Reusable Security Scanner
+# TrustScan Reusable Security Scanner
 # Called by lightweight stubs in user repositories via workflow_call.
 # All scan logic lives here — stubs only reference this workflow.
 #
 # Usage in stub:
 #   jobs:
 #     security-scan:
-#       uses: secureyours/scan-engine/.github/workflows/reusable-scan.yml@main
+#       uses: prudhvireddy20/scan-engine/.github/workflows/reusable-scan.yml@main
 #       with:
 #         job_id: ${{ inputs.job_id }}
 #         scanners: ${{ inputs.scanners }}
+#
+# Both inputs are optional. A run the customer triggers themselves (a push, a
+# schedule) has neither: its job id is then `gh-<run id>`, which is the name
+# the platform gives the scan it records for that run, and the default
+# engines run.
+#
+# Engines are named ts-e1 … ts-e7 everywhere a customer can see: job names,
+# result names and the summary. `scanners` takes those ids; older platform
+# versions sent scanner names, which are still accepted and mapped.
+#
+# ts-e1 runs only TrustScan's own rules and openly licensed ones (rules/ in
+# this repository). Never the Semgrep Registry (`--config auto`, `p/...`): its
+# licence allows internal use only, not use as a service, paid or free.
+# ts-e2 runs only when the platform asks for it: on a public repository, or a
+# private one whose owner has GitHub Advanced Security (its licence's terms).
 
-name: DevSecOps Reusable Scanner
+name: TrustScan Reusable Scanner
 
 on:
   workflow_call:
     inputs:
       job_id:
-        description: 'Unique scan job ID assigned by the DevSecOps platform'
-        required: true
+        description: 'Scan job ID assigned by the TrustScan platform. Empty: gh-<run id>'
+        required: false
         type: string
+        default: ''
       scanners:
-        description: 'Comma-separated list of scanners to run (e.g. semgrep,gitleaks,trivy)'
-        required: true
+        description: 'Comma-separated engine ids (ts-e1 … ts-e7, dep-resolve). Empty: ts-e1,ts-e3,ts-e4'
+        required: false
         type: string
+        default: ''
+      resolver_registry:
+        description: 'Where the dependency resolver images are published (dep-resolve)'
+        required: false
+        type: string
+        default: 'ghcr.io/prudhvireddy20'
+      resolver_tag:
+        description: 'Resolver image tag (dep-resolve)'
+        required: false
+        type: string
+        default: 'main'
+      engine_repository:
+        description: 'Repository holding the rules ts-e1 runs (this one)'
+        required: false
+        type: string
+        default: 'prudhvireddy20/scan-engine'
+      engine_ref:
+        description: 'Branch or tag of engine_repository'
+        required: false
+        type: string
+        default: 'main'
 
 env:
-  JOB_ID: ${{ inputs.job_id }}
+  # github.run_id is the calling workflow's run, the one the webhook reports.
+  JOB_ID: ${{ inputs.job_id || format('gh-{0}', github.run_id) }}
+  SCANNERS: ${{ inputs.scanners || 'ts-e1,ts-e3,ts-e4' }}
 
 jobs:
-  # ── Setup: parse scanner flags ──────────────────────
+  # ── Setup: which engines run ────────────────────────
   setup:
-    name: Setup Scan Environment
+    name: Prepare scan
     runs-on: ubuntu-latest
     outputs:
-      has_semgrep: ${{ steps.detect.outputs.has_semgrep }}
-      has_gitleaks: ${{ steps.detect.outputs.has_gitleaks }}
-      has_trivy: ${{ steps.detect.outputs.has_trivy }}
-      has_osv: ${{ steps.detect.outputs.has_osv }}
-      has_syft: ${{ steps.detect.outputs.has_syft }}
-      has_codeql: ${{ steps.detect.outputs.has_codeql }}
-      has_noir: ${{ steps.detect.outputs.has_noir }}
+      engines: ${{ steps.detect.outputs.engines }}
+      ts_e1: ${{ steps.detect.outputs.ts_e1 }}
+      ts_e2: ${{ steps.detect.outputs.ts_e2 }}
+      ts_e3: ${{ steps.detect.outputs.ts_e3 }}
+      ts_e4: ${{ steps.detect.outputs.ts_e4 }}
+      ts_e5: ${{ steps.detect.outputs.ts_e5 }}
+      ts_e6: ${{ steps.detect.outputs.ts_e6 }}
+      ts_e7: ${{ steps.detect.outputs.ts_e7 }}
+      dep_resolve: ${{ steps.detect.outputs.dep_resolve }}
     steps:
-      - name: Parse scanner selection
+      - name: Choose engines
         id: detect
         run: |
-          SCANNERS="${{ inputs.scanners }}"
-          echo "Job ID: ${{ env.JOB_ID }}"
-          echo "Scanners requested: $SCANNERS"
+          # Older platform versions send scanner names; map them to engine ids.
+          declare -A ID=([semgrep]=ts-e1 [codeql]=ts-e2 [gitleaks]=ts-e3 [trivy]=ts-e4
+                         [osv-scanner]=ts-e5 [osv]=ts-e5 [syft]=ts-e6 [noir]=ts-e7 [owasp-noir]=ts-e7)
+          WANT=" "
+          IFS=',' read -ra TOKENS <<< "$SCANNERS"
+          for t in "${TOKENS[@]}"; do
+            t=$(printf '%s' "$t" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+            [ -n "$t" ] || continue
+            t=${ID[$t]:-$t}
+            WANT="$WANT$t "
+          done
+          LIST=""
+          for e in ts-e1 ts-e2 ts-e3 ts-e4 ts-e5 ts-e6 ts-e7 dep-resolve; do
+            if [[ "$WANT" == *" $e "* ]]; then v=true; LIST="$LIST,$e"; else v=false; fi
+            echo "${e//-/_}=$v" >> "$GITHUB_OUTPUT"
+          done
+          echo "engines=${LIST#,}" >> "$GITHUB_OUTPUT"
+          echo "Job ID: $JOB_ID"
+          echo "Engines: ${LIST#,}"
 
-          [[ "$SCANNERS" == *"semgrep"* ]]      && echo "has_semgrep=true" >> $GITHUB_OUTPUT || echo "has_semgrep=false" >> $GITHUB_OUTPUT
-          [[ "$SCANNERS" == *"gitleaks"* ]]      && echo "has_gitleaks=true" >> $GITHUB_OUTPUT || echo "has_gitleaks=false" >> $GITHUB_OUTPUT
-          [[ "$SCANNERS" == *"trivy"* ]]         && echo "has_trivy=true" >> $GITHUB_OUTPUT || echo "has_trivy=false" >> $GITHUB_OUTPUT
-          [[ "$SCANNERS" == *"osv-scanner"* ]]   && echo "has_osv=true" >> $GITHUB_OUTPUT || echo "has_osv=false" >> $GITHUB_OUTPUT
-          [[ "$SCANNERS" == *"syft"* ]]          && echo "has_syft=true" >> $GITHUB_OUTPUT || echo "has_syft=false" >> $GITHUB_OUTPUT
-          [[ "$SCANNERS" == *"codeql"* ]]        && echo "has_codeql=true" >> $GITHUB_OUTPUT || echo "has_codeql=false" >> $GITHUB_OUTPUT
-          [[ "$SCANNERS" == *"noir"* || "$SCANNERS" == *"owasp-noir"* ]] && echo "has_noir=true" >> $GITHUB_OUTPUT || echo "has_noir=false" >> $GITHUB_OUTPUT
-
-  # ── Semgrep SAST ────────────────────────────────────
-  semgrep:
-    name: Semgrep SAST
+  # ── Dependency resolution for supply chain analysis ─
+  # The repository's own runner is the build sandbox: the resolver may run the
+  # project's build code here (Gradle, setup.py, source-only packages), with no
+  # token and no network but the package registries (resolver/ci/run.sh, shipped
+  # in the image). The platform reads dep-resolution-<job_id>.
+  dep-resolve:
+    name: Dependency resolution
     needs: setup
-    if: needs.setup.outputs.has_semgrep == 'true'
+    if: needs.setup.outputs.dep_resolve == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      REG: ${{ inputs.resolver_registry }}
+      TAG: ${{ inputs.resolver_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: src
+          persist-credentials: false
+
+      - name: Resolve
+        run: |
+          [[ "$REG" =~ ^[a-z0-9./_-]+$ && "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad image reference"; exit 1; }
+          export RESOLVER_IMAGE=$REG/trustscan-dep-resolver:$TAG RESOLVER_BUILD_IMAGE=$REG/trustscan-dep-resolver-build:$TAG
+          export EGRESS_IMAGE=$REG/trustscan-resolver-egress:$TAG EGRESS_BUILD_IMAGE=$REG/trustscan-resolver-egress-build:$TAG
+          for i in "$RESOLVER_IMAGE" "$RESOLVER_BUILD_IMAGE" "$EGRESS_IMAGE" "$EGRESS_BUILD_IMAGE"; do docker pull -q "$i"; done
+          docker run --rm --entrypoint cat "$RESOLVER_IMAGE" /opt/resolver/ci/run.sh > run.sh
+          bash run.sh src out --build-mode
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dep-resolution-${{ env.JOB_ID }}
+          path: |
+            out/resolved-deps.json
+            out/meta.json
+          retention-days: 7
+
+  # ── ts-e1: static code analysis ─────────────────────
+  ts-e1:
+    name: Static code analysis (ts-e1)
+    needs: setup
+    if: needs.setup.outputs.ts_e1 == 'true'
     runs-on: ubuntu-latest
     container:
       image: semgrep/semgrep:latest
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
-
-      - name: Run Semgrep
-        run: |
-          semgrep scan --config auto --json --output semgrep-results.json . || echo '{"results":[],"errors":[]}' > semgrep-results.json
-          echo "Semgrep scan completed"
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: semgrep-results-${{ env.JOB_ID }}
-          path: semgrep-results.json
+          path: src
+          persist-credentials: false
 
-  # ── Gitleaks Secret Detection ───────────────────────
-  gitleaks:
-    name: Gitleaks Secrets Detection
+      - name: Fetch TrustScan rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ inputs.engine_repository }}
+          ref: ${{ inputs.engine_ref }}
+          sparse-checkout: |
+            rules/semgrep
+            rules/semgrep-open
+          path: trustscan
+          persist-credentials: false
+
+      - name: Analyse
+        run: |
+          RULES="$GITHUB_WORKSPACE/trustscan/rules"
+          OUT="$GITHUB_WORKSPACE/ts-e1.json"
+          if [ ! -d "$RULES/semgrep" ] || [ ! -d "$RULES/semgrep-open" ]; then
+            echo "::error::TrustScan's rules are missing from the engine repository"
+            exit 1
+          fi
+          cd src
+          # Generated docs and bundled third-party code are left out: on 14
+          # real apps they were 245 of 1,913 findings, none in the app's code.
+          if ! semgrep scan \
+              --config "$RULES/semgrep" --config "$RULES/semgrep-open" \
+              --dataflow-traces --metrics=off --disable-version-check \
+              --exclude=docs --exclude=doc \
+              --exclude='*.min.js' --exclude='*.bundle.js' \
+              --exclude='**/static/**/libs/**' --exclude='**/static/**/vendor/**' \
+              --exclude=vendor --exclude=third_party --exclude=node_modules \
+              --json --output "$OUT" . >/dev/null 2>"$GITHUB_WORKSPACE/engine.log"; then
+            echo "::warning::ts-e1 reported an error; partial results kept"
+          fi
+          [ -s "$OUT" ] || echo '{"results":[],"errors":[]}' > "$OUT"
+          echo "ts-e1 finished"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ts-e1-results-${{ env.JOB_ID }}
+          path: ts-e1.json
+
+  # ── ts-e3: secret detection ─────────────────────────
+  ts-e3:
+    name: Secret detection (ts-e3)
     needs: setup
-    if: needs.setup.outputs.has_gitleaks == 'true'
+    if: needs.setup.outputs.ts_e3 == 'true'
     runs-on: ubuntu-latest
     container:
       image: zricethezav/gitleaks:latest
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
-
-      - name: Run Gitleaks
-        run: |
-          gitleaks detect --source=. --report-path=gitleaks-results.json --report-format=json --no-git --exit-code 0 || echo '[]' > gitleaks-results.json
-          if [ ! -s gitleaks-results.json ]; then
-            echo '[]' > gitleaks-results.json
-          fi
-          echo "Gitleaks scan completed"
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: gitleaks-results-${{ env.JOB_ID }}
-          path: gitleaks-results.json
+          persist-credentials: false
 
-  # ── Trivy Vulnerability Scanner ─────────────────────
-  trivy:
-    name: Trivy Vulnerability Scanner
+      - name: Analyse
+        run: |
+          gitleaks detect --source=. --report-path=ts-e3.json --report-format=json --no-git \
+            --exit-code 0 >/dev/null 2>&1 || true
+          [ -s ts-e3.json ] || echo '[]' > ts-e3.json
+          echo "ts-e3 finished"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ts-e3-results-${{ env.JOB_ID }}
+          path: ts-e3.json
+
+  # ── ts-e4: dependency and configuration analysis ────
+  ts-e4:
+    name: Dependency and configuration analysis (ts-e4)
     needs: setup
-    if: needs.setup.outputs.has_trivy == 'true'
+    if: needs.setup.outputs.ts_e4 == 'true'
     runs-on: ubuntu-latest
     container:
       image: aquasec/trivy:latest
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
-
-      - name: Run Trivy
-        run: |
-          trivy fs --format json --output trivy-results.json . || true
-          if [ ! -s trivy-results.json ]; then
-            echo '{"Results":[]}' > trivy-results.json
-          fi
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: trivy-results-${{ env.JOB_ID }}
-          path: trivy-results.json
+          persist-credentials: false
 
-  # ── OSV-Scanner ─────────────────────────────────────
-  osv-scanner:
-    name: OSV Vulnerability Scanner
+      - name: Analyse
+        run: |
+          trivy fs --quiet --scanners vuln,secret,misconfig --format json --output ts-e4.json . >/dev/null 2>&1 || true
+          [ -s ts-e4.json ] || echo '{"Results":[]}' > ts-e4.json
+          echo "ts-e4 finished"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ts-e4-results-${{ env.JOB_ID }}
+          path: ts-e4.json
+
+  # ── ts-e5: advisory matching ────────────────────────
+  ts-e5:
+    name: Advisory matching (ts-e5)
     needs: setup
-    if: needs.setup.outputs.has_osv == 'true'
+    if: needs.setup.outputs.ts_e5 == 'true'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/google/osv-scanner:latest
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
-
-      - name: Run OSV-Scanner
-        run: |
-          /osv-scanner --format json -r . > osv-results.json 2>&1 || true
-          if [ ! -s osv-results.json ]; then
-            echo '{"results":[]}' > osv-results.json
-          fi
-          echo "OSV-Scanner completed"
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: osv-results-${{ env.JOB_ID }}
-          path: osv-results.json
+          persist-credentials: false
 
-  # ── Syft SBOM Generation ────────────────────────────
-  syft:
-    name: Syft SBOM Generation
+      - name: Analyse
+        run: |
+          # JSON goes to --output, never through a shell redirect: progress
+          # lines on stderr would end up inside the JSON.
+          /osv-scanner --format json --output ts-e5.json -r . >/dev/null 2>&1 || true
+          # The image has no jq or python: check the file starts as an object.
+          if [ ! -s ts-e5.json ] || [ "$(head -c 1 ts-e5.json)" != "{" ]; then
+            echo '{"results":[]}' > ts-e5.json
+          fi
+          echo "ts-e5 finished"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ts-e5-results-${{ env.JOB_ID }}
+          path: ts-e5.json
+
+  # ── ts-e6: component inventory ──────────────────────
+  ts-e6:
+    name: Component inventory (ts-e6)
     needs: setup
-    if: needs.setup.outputs.has_syft == 'true'
+    if: needs.setup.outputs.ts_e6 == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
-
-      - name: Generate SBOM with Syft
-        run: |
-          docker run --rm -v "$PWD:/src" anchore/syft:latest /src -o json > syft-sbom.json || true
-          if [ ! -s syft-sbom.json ]; then
-            echo '{"artifacts":[]}' > syft-sbom.json
-          fi
-          echo "Syft SBOM generated"
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: syft-sbom-${{ env.JOB_ID }}
-          path: syft-sbom.json
+          persist-credentials: false
 
-  # ── OWASP Noir Attack Surface ───────────────────────
-  owasp-noir:
-    name: OWASP Noir Attack Surface
+      - name: Analyse
+        run: |
+          docker run --rm -v "$PWD:/src" anchore/syft:latest /src -q -o json > ts-e6.json 2>/dev/null || true
+          [ -s ts-e6.json ] || echo '{"artifacts":[]}' > ts-e6.json
+          echo "ts-e6 finished"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ts-e6-sbom-${{ env.JOB_ID }}
+          path: ts-e6.json
+
+  # ── ts-e7: attack surface mapping ───────────────────
+  ts-e7:
+    name: Attack surface mapping (ts-e7)
     needs: setup
-    if: needs.setup.outputs.has_noir == 'true'
+    if: needs.setup.outputs.ts_e7 == 'true'
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/owasp-noir/noir:latest
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
-
-      - name: Run Noir
-        run: |
-          noir -b . -o noir-results.json --format json || true
-          if [ ! -s noir-results.json ]; then
-            echo '{"endpoints":[],"url":"","method":""}' > noir-results.json
-          fi
-          echo "OWASP Noir scan completed"
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          name: noir-results-${{ env.JOB_ID }}
-          path: noir-results.json
+          persist-credentials: false
 
-  # ── CodeQL Deep Analysis ────────────────────────────
-  codeql:
-    name: CodeQL Analysis
+      - name: Analyse
+        run: |
+          noir -b . -o ts-e7.json --format json --passive-scan >/dev/null 2>&1 || true
+          [ -s ts-e7.json ] || echo '{"endpoints":[],"url":"","method":""}' > ts-e7.json
+          echo "ts-e7 finished"
+
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ts-e7-results-${{ env.JOB_ID }}
+          path: ts-e7.json
+
+  # ── ts-e2: deep dataflow analysis ───────────────────
+  # Requested by the platform only for a public repository, or a private one
+  # whose owner has GitHub Advanced Security (backend core/codeql_licence.py).
+  ts-e2:
+    name: Deep dataflow analysis (ts-e2)
     needs: setup
-    if: needs.setup.outputs.has_codeql == 'true'
+    if: needs.setup.outputs.ts_e2 == 'true'
     runs-on: ubuntu-latest
     permissions:
       security-events: write
       contents: read
     steps:
-      - name: Checkout caller repository
-        uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - name: Detect Languages
+      - name: Detect languages
         id: detect-languages
         run: |
           LANGS=""
@@ -231,62 +365,64 @@ jobs:
           LANGS="${LANGS#,}"
           if [ -z "$LANGS" ]; then LANGS="javascript"; fi
           echo "languages=$LANGS" >> $GITHUB_OUTPUT
-          echo "Detected languages: $LANGS"
 
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
+      - name: Prepare
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
           languages: ${{ steps.detect-languages.outputs.languages }}
         continue-on-error: true
 
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
+      - name: Build
+        uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         continue-on-error: true
 
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
+      - name: Analyse
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
         with:
-          output: codeql-results
+          output: ts-e2
         continue-on-error: true
 
       - name: Ensure results exist
         run: |
-          mkdir -p codeql-results
-          if [ ! "$(ls -A codeql-results 2>/dev/null)" ]; then
-            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"CodeQL"}},"results":[]}]}' > codeql-results/results.sarif
+          mkdir -p ts-e2
+          if [ ! "$(ls -A ts-e2 2>/dev/null)" ]; then
+            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ts-e2"}},"results":[]}]}' > ts-e2/results.sarif
           fi
 
-      - name: Upload Results
-        uses: actions/upload-artifact@v7
+      - name: Upload results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: codeql-results-${{ env.JOB_ID }}
-          path: codeql-results
+          name: ts-e2-results-${{ env.JOB_ID }}
+          path: ts-e2
 
   # ── Summary ─────────────────────────────────────────
   collect-results:
-    name: Collect and Report Results
-    needs: [semgrep, gitleaks, trivy, osv-scanner, syft, codeql, owasp-noir]
+    name: Scan summary
+    needs: [setup, ts-e1, ts-e2, ts-e3, ts-e4, ts-e5, ts-e6, ts-e7]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Download all scan artifacts
-        uses: actions/download-artifact@v8
+      - name: Download results
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: ./all-results
           pattern: '*-${{ env.JOB_ID }}'
           merge-multiple: false
 
       - name: Create summary
+        env:
+          ENGINES: ${{ needs.setup.outputs.engines }}
         run: |
-          echo "## 🔐 DevSecOps Security Scan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Job ID:** ${{ env.JOB_ID }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Scanners:** ${{ inputs.scanners }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifacts Generated" >> $GITHUB_STEP_SUMMARY
-          for dir in ./all-results/*/; do
-            if [ -d "$dir" ]; then
-              name=$(basename "$dir")
-              echo "- ✅ $name" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
+          {
+            echo "## 🔐 TrustScan Security Scan Summary"
+            echo ""
+            echo "**Job ID:** ${JOB_ID}"
+            echo "**Engines:** ${ENGINES}"
+            echo ""
+            echo "### Results"
+            for dir in ./all-results/*/; do
+              [ -d "$dir" ] && echo "- ✅ $(basename "$dir")"
+            done
+            echo ""
+            echo "Results are sent to TrustScan; open the scan in the dashboard."
+          } >> "$GITHUB_STEP_SUMMARY"
