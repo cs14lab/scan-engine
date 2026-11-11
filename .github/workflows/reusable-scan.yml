@@ -5,7 +5,7 @@
 # Usage in stub:
 #   jobs:
 #     security-scan:
-#       uses: prudhvireddy20/scan-engine/.github/workflows/reusable-scan.yml@main
+#       uses: cs14lab/scan-engine/.github/workflows/reusable-scan.yml@main
 #       with:
 #         job_id: ${{ inputs.job_id }}
 #         scanners: ${{ inputs.scanners }}
@@ -54,7 +54,7 @@ on:
         description: 'Repository holding the rules ts-e1 runs (this one)'
         required: false
         type: string
-        default: 'prudhvireddy20/scan-engine'
+        default: 'cs14lab/scan-engine'
       engine_ref:
         description: 'Branch or tag of engine_repository'
         required: false
