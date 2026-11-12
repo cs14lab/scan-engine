@@ -49,7 +49,7 @@ on:
         description: 'Resolver image tag (dep-resolve)'
         required: false
         type: string
-        default: 'main'
+        default: 'v1'   # release-pinned: scripts/release-scan-engine.sh sets the release tag
       engine_repository:
         description: 'Repository holding the rules ts-e1 runs (this one)'
         required: false
@@ -59,12 +59,23 @@ on:
         description: 'Branch or tag of engine_repository'
         required: false
         type: string
-        default: 'main'
+        default: 'v1'   # release-pinned: scripts/release-scan-engine.sh sets the release tag
 
 env:
   # github.run_id is the calling workflow's run, the one the webhook reports.
   JOB_ID: ${{ inputs.job_id || format('gh-{0}', github.run_id) }}
   SCANNERS: ${{ inputs.scanners || 'ts-e1,ts-e3,ts-e4' }}
+  # The public half of the key the resolver images are signed with (the image
+  # build signs; see .github/workflows/aegis-resolver-image.yml in the platform
+  # repository). While it is set, dep-resolve runs an image only if its
+  # signature verifies, so an image pushed by anyone without the private key
+  # never runs in a customer's repository. Empty: no check. Publish this file
+  # only after signed images exist under the tag in use (aegis-resolver-release.yml).
+  RESOLVER_PUBLIC_KEY: |
+    -----BEGIN PUBLIC KEY-----
+    MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1q+kY3tcSVOa11SBycgpYgsj1mhF
+    zA4yePjcN/fZh092g29iCZszdMvjJTzQwAQBJ6hartbQYZV4yJKnDqj/8A==
+    -----END PUBLIC KEY-----
 
 jobs:
   # ── Setup: which engines run ────────────────────────
@@ -138,12 +149,34 @@ jobs:
           path: src
           persist-credentials: false
 
+      - name: Install signature verifier
+        if: env.RESOLVER_PUBLIC_KEY != ''
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
       - name: Resolve
         run: |
           [[ "$REG" =~ ^[a-z0-9./_-]+$ && "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad image reference"; exit 1; }
-          export RESOLVER_IMAGE=$REG/trustscan-dep-resolver:$TAG RESOLVER_BUILD_IMAGE=$REG/trustscan-dep-resolver-build:$TAG
-          export EGRESS_IMAGE=$REG/trustscan-resolver-egress:$TAG EGRESS_BUILD_IMAGE=$REG/trustscan-resolver-egress-build:$TAG
-          for i in "$RESOLVER_IMAGE" "$RESOLVER_BUILD_IMAGE" "$EGRESS_IMAGE" "$EGRESS_BUILD_IMAGE"; do docker pull -q "$i"; done
+          if [ -n "$RESOLVER_PUBLIC_KEY" ]; then printf '%s\n' "$RESOLVER_PUBLIC_KEY" > "$RUNNER_TEMP/resolver.pub"; fi
+          # Each image is pulled, pinned to the digest that was pulled, and
+          # (when a key is set) verified before anything in it runs. From here
+          # on only the digest is used, so the tag moving cannot swap the image.
+          pinned() {
+            docker pull -q "$REG/$1:$TAG" >/dev/null
+            local ref
+            ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$REG/$1:$TAG")
+            [[ "$ref" == "$REG/$1@sha256:"* ]] || { echo "::error::no digest for $1" >&2; exit 1; }
+            if [ -n "$RESOLVER_PUBLIC_KEY" ]; then
+              cosign verify --key "$RUNNER_TEMP/resolver.pub" "$ref" >/dev/null 2>&1 \
+                || { echo "::error::The signature of $1 could not be verified; it was not run." >&2; exit 1; }
+            fi
+            echo "$ref"
+          }
+          RESOLVER_IMAGE=$(pinned trustscan-dep-resolver)
+          RESOLVER_BUILD_IMAGE=$(pinned trustscan-dep-resolver-build)
+          EGRESS_IMAGE=$(pinned trustscan-resolver-egress)
+          EGRESS_BUILD_IMAGE=$(pinned trustscan-resolver-egress-build)
+          export RESOLVER_IMAGE RESOLVER_BUILD_IMAGE EGRESS_IMAGE EGRESS_BUILD_IMAGE
+          [ -n "$RESOLVER_PUBLIC_KEY" ] && echo "Image signatures verified." || echo "Image signatures not checked (no key set)."
           docker run --rm --entrypoint cat "$RESOLVER_IMAGE" /opt/resolver/ci/run.sh > run.sh
           bash run.sh src out --build-mode
 
