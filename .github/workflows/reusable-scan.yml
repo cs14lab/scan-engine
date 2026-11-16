@@ -394,7 +394,6 @@ jobs:
     if: needs.setup.outputs.ts_e2 == 'true'
     runs-on: ubuntu-latest
     permissions:
-      security-events: write
       contents: read
     steps:
       - name: Checkout repository
@@ -403,47 +402,80 @@ jobs:
           ref: ${{ needs.setup.outputs.commit }}
           persist-credentials: false
 
-      - name: Detect languages
-        id: detect-languages
-        run: |
-          LANGS=""
-          if find . -name "*.py" -type f | head -1 | grep -q .; then LANGS="$LANGS,python"; fi
-          if find . \( -name "*.js" -o -name "*.ts" \) -type f | head -1 | grep -q .; then LANGS="$LANGS,javascript"; fi
-          if find . -name "*.java" -type f | head -1 | grep -q .; then LANGS="$LANGS,java"; fi
-          if find . -name "*.go" -type f | head -1 | grep -q .; then LANGS="$LANGS,go"; fi
-          if find . -name "*.rb" -type f | head -1 | grep -q .; then LANGS="$LANGS,ruby"; fi
-          LANGS="${LANGS#,}"
-          if [ -z "$LANGS" ]; then LANGS="javascript"; fi
-          echo "languages=$LANGS" >> $GITHUB_OUTPUT
-
-      - name: Prepare
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
-        with:
-          languages: ${{ steps.detect-languages.outputs.languages }}
-        continue-on-error: true
-
-      - name: Build
-        uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
-        continue-on-error: true
-
+      # One database and one analysis per language, with the command line
+      # directly. The init / autobuild / analyze actions build every language
+      # as one unit: a single language that could not be built (a Java folder
+      # with no build file at the root) ended the whole analysis, each step's
+      # continue-on-error hid it, and an empty result was written in its place.
+      # The scan then read "0 findings" for every language (external
+      # benchmark, Nov 2026, F20). C# was not in the language list at all.
+      #   - build mode "none" for Java and C#: nothing has to compile here.
+      #   - a language that fails is named in a warning and the others go on.
       - name: Analyse
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
-        with:
-          output: ts-e2
-        continue-on-error: true
+        id: analyse
+        run: |
+          CODEQL=$(ls -d /opt/hostedtoolcache/CodeQL/*/x64/codeql 2>/dev/null | sort -V | tail -1)/codeql
+          if [ ! -x "$CODEQL" ]; then
+            curl -sSfL https://github.com/github/codeql-action/releases/download/codeql-bundle-v2.23.6/codeql-bundle-linux64.tar.gz \
+              | tar -xz -C "$RUNNER_TEMP"
+            CODEQL="$RUNNER_TEMP/codeql/codeql"
+          fi
+          "$CODEQL" version --format=terse
 
-      - name: Ensure results exist
+          has() {
+            find -H . \( -path '*/node_modules' -o -path '*/vendor' -o -path './.git' \) -prune \
+              -o -type f \( "$@" \) -print -quit | grep -q .
+          }
+          LANGS=""
+          has -name '*.py' && LANGS="$LANGS python"
+          has -name '*.js' -o -name '*.ts' -o -name '*.jsx' -o -name '*.tsx' -o -name '*.mjs' && LANGS="$LANGS javascript"
+          has -name '*.java' -o -name '*.kt' && LANGS="$LANGS java"
+          has -name '*.cs' && LANGS="$LANGS csharp"
+          has -name '*.go' && LANGS="$LANGS go"
+          has -name '*.rb' && LANGS="$LANGS ruby"
+          echo "Languages:${LANGS:- none}"
+
+          # As the CodeQL action sizes it: the runner's memory less what the
+          # system needs.
+          RAM=$(( $(awk '/MemTotal/ {print int($2 / 1024)}' /proc/meminfo) - 1536 ))
+
+          mkdir -p ts-e2
+          DONE=""; FAILED=""
+          for lang in $LANGS; do
+            mode=none
+            [ "$lang" = go ] && mode=autobuild          # Go has no build-free mode
+            if "$CODEQL" database create "$RUNNER_TEMP/db-$lang" --language="$lang" --build-mode="$mode" \
+                 --source-root=. --threads=0 --ram="$RAM" --overwrite \
+               && "$CODEQL" database analyze "$RUNNER_TEMP/db-$lang" "codeql/$lang-queries" \
+                 --format=sarif-latest --sarif-category="$lang" --output="ts-e2/$lang.sarif" \
+                 --threads=0 --ram="$RAM"; then
+              DONE="$DONE $lang"
+            else
+              rm -f "ts-e2/$lang.sarif"
+              FAILED="$FAILED $lang"
+              echo "::warning::$lang could not be analysed by the deep dataflow engine; the other languages were."
+            fi
+          done
+          echo "Analysed:${DONE:- none}. Not analysed:${FAILED:- none}."
+          echo "languages=${LANGS# }" >> "$GITHUB_OUTPUT"
+          echo "analysed=${DONE# }" >> "$GITHUB_OUTPUT"
+
+      # An empty result means "looked, found nothing". It is written only when
+      # that is true: no language here for this engine to analyse. When there
+      # were languages and none could be analysed, nothing is uploaded, and the
+      # platform records the engine as not having run.
+      - name: Nothing to analyse
+        if: steps.analyse.outputs.languages == ''
         run: |
           mkdir -p ts-e2
-          if [ ! "$(ls -A ts-e2 2>/dev/null)" ]; then
-            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ts-e2"}},"results":[]}]}' > ts-e2/results.sarif
-          fi
+          echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ts-e2"}},"results":[]}]}' > ts-e2/results.sarif
 
       - name: Upload results
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: ts-e2-results-${{ env.JOB_ID }}
-          path: ts-e2
+          path: ts-e2/*.sarif
+          if-no-files-found: warn
 
   # ── Summary ─────────────────────────────────────────
   collect-results:
