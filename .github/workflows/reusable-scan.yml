@@ -1,29 +1,16 @@
-# TrustScan Reusable Security Scanner
-# Called by lightweight stubs in user repositories via workflow_call.
-# All scan logic lives here — stubs only reference this workflow.
+# TrustScan Security Scan: the workflow connected repositories' stubs call.
 #
-# Usage in stub:
-#   jobs:
-#     security-scan:
-#       uses: cs14lab/scan-engine/.github/workflows/reusable-scan.yml@main
-#       with:
-#         job_id: ${{ inputs.job_id }}
-#         scanners: ${{ inputs.scanners }}
+# Every run is approved by TrustScan before anything runs. The stub passes the
+# scan's job id and a one-time ticket; the first job proves to TrustScan, with
+# GitHub's OIDC token for this run, that it is this workflow at its released
+# tag, started by a dispatch, on a GitHub-hosted runner, in the ticket's
+# repository. TrustScan answers with the scan's plan (engines, commit). A run
+# TrustScan did not start gets no plan and stops here.
 #
-# Both inputs are optional. A run the customer triggers themselves (a push, a
-# schedule) has neither: its job id is then `gh-<run id>`, which is the name
-# the platform gives the scan it records for that run, and the default
-# engines run.
-#
-# Engines are named ts-e1 … ts-e7 everywhere a customer can see: job names,
-# result names and the summary. `scanners` takes those ids; older platform
-# versions sent scanner names, which are still accepted and mapped.
-#
-# ts-e1 runs only TrustScan's own rules and openly licensed ones (rules/ in
-# this repository). Never the Semgrep Registry (`--config auto`, `p/...`): its
-# licence allows internal use only, not use as a service, paid or free.
-# ts-e2 runs only when the platform asks for it: on a public repository, or a
-# private one whose owner has GitHub Advanced Security (its licence's terms).
+# The engines run from the TrustScan engine image. TrustScan's own code in it
+# is encrypted; the scan job asks TrustScan for the key and passes it to the
+# image on stdin. Results are sealed to TrustScan's key inside the image before
+# upload: only TrustScan can read them.
 
 name: TrustScan Reusable Scanner
 
@@ -31,415 +18,247 @@ on:
   workflow_call:
     inputs:
       job_id:
-        description: 'Scan job ID assigned by the TrustScan platform. Empty: gh-<run id>'
+        description: 'Scan job ID (set by TrustScan)'
+        required: true
+        type: string
+      ticket:
+        description: 'One-time scan ticket (set by TrustScan)'
+        required: true
+        type: string
+      engine_tag:
+        description: 'Engine image tag'
         required: false
         type: string
-        default: ''
-      scanners:
-        description: 'Comma-separated engine ids (ts-e1 … ts-e7, dep-resolve). Empty: ts-e1,ts-e3,ts-e4'
-        required: false
-        type: string
-        default: ''
-      resolver_registry:
-        description: 'Where the dependency resolver images are published (dep-resolve)'
-        required: false
-        type: string
-        default: 'ghcr.io/cs14lab'
+        default: 'v2'   # release-pinned: scripts/release-scan-engine.sh sets the release tag
       resolver_tag:
-        description: 'Resolver image tag (dep-resolve)'
+        description: 'Resolver image tag (dependency resolution)'
         required: false
         type: string
-        default: 'main'
-      engine_repository:
-        description: 'Repository holding the rules ts-e1 runs (this one)'
-        required: false
-        type: string
-        default: 'cs14lab/scan-engine'
-      engine_ref:
-        description: 'Branch or tag of engine_repository'
-        required: false
-        type: string
-        default: 'main'
+        default: 'v2'   # release-pinned: scripts/release-scan-engine.sh sets the release tag
 
 env:
-  # github.run_id is the calling workflow's run, the one the webhook reports.
-  JOB_ID: ${{ inputs.job_id || format('gh-{0}', github.run_id) }}
-  SCANNERS: ${{ inputs.scanners || 'ts-e1,ts-e3,ts-e4' }}
+  JOB_ID: ${{ inputs.job_id }}
+  TRUSTSCAN_API: https://trustscan.sc.deeptrustxai.com
+  OIDC_AUDIENCE: trustscan-engine
+  REG: ghcr.io/cs14lab
+  # The public half of the key TrustScan's images are signed with: an image
+  # runs only if its signature verifies. Empty: no check.
+  IMAGE_PUBLIC_KEY: |
+    -----BEGIN PUBLIC KEY-----
+    MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjrd3dwO76+VBphmiHujzwvmuv543
+    7iuutndNiAvA+LhpxuIAUP6EESOszSoLX0iI84sZ06or2Tni//+Tmz1pFw==
+    -----END PUBLIC KEY-----
 
 jobs:
-  # ── Setup: which engines run ────────────────────────
-  setup:
+  # ── Approval: TrustScan checks the run and returns the plan ──
+  gate:
     name: Prepare scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
     outputs:
-      engines: ${{ steps.detect.outputs.engines }}
-      commit: ${{ steps.detect.outputs.commit }}
-      ts_e1: ${{ steps.detect.outputs.ts_e1 }}
-      ts_e2: ${{ steps.detect.outputs.ts_e2 }}
-      ts_e3: ${{ steps.detect.outputs.ts_e3 }}
-      ts_e4: ${{ steps.detect.outputs.ts_e4 }}
-      ts_e5: ${{ steps.detect.outputs.ts_e5 }}
-      ts_e6: ${{ steps.detect.outputs.ts_e6 }}
-      ts_e7: ${{ steps.detect.outputs.ts_e7 }}
-      dep_resolve: ${{ steps.detect.outputs.dep_resolve }}
+      engines: ${{ steps.plan.outputs.engines }}
+      in_image: ${{ steps.plan.outputs.in_image }}
+      ts_e2: ${{ steps.plan.outputs.ts_e2 }}
+      dep_resolve: ${{ steps.plan.outputs.dep_resolve }}
+      commit: ${{ steps.plan.outputs.commit }}
     steps:
-      - name: Choose engines
-        id: detect
+      - name: Ask TrustScan to approve this run
+        id: plan
+        env:
+          TICKET: ${{ inputs.ticket }}
         run: |
-          # Older platform versions send scanner names; map them to engine ids.
-          declare -A ID=([semgrep]=ts-e1 [codeql]=ts-e2 [gitleaks]=ts-e3 [trivy]=ts-e4
-                         [osv-scanner]=ts-e5 [osv]=ts-e5 [syft]=ts-e6 [noir]=ts-e7 [owasp-noir]=ts-e7)
-          WANT=" "
-          COMMIT=""
-          IFS=',' read -ra TOKENS <<< "$SCANNERS"
-          for t in "${TOKENS[@]}"; do
-            t=$(printf '%s' "$t" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
-            [ -n "$t" ] || continue
-            # commit=<sha>: the commit the platform pinned the scan to. Every
-            # job checks it out, so a commit landing on the branch after the
-            # scan started (the platform's own stub update, a push) does not
-            # change what is scanned or the resolution cutoff.
-            if [[ "$t" =~ ^commit=([0-9a-f]{40})$ ]]; then COMMIT=${BASH_REMATCH[1]}; continue; fi
-            t=${ID[$t]:-$t}
-            WANT="$WANT$t "
-          done
-          LIST=""
-          for e in ts-e1 ts-e2 ts-e3 ts-e4 ts-e5 ts-e6 ts-e7 dep-resolve; do
-            if [[ "$WANT" == *" $e "* ]]; then v=true; LIST="$LIST,$e"; else v=false; fi
-            echo "${e//-/_}=$v" >> "$GITHUB_OUTPUT"
-          done
-          echo "engines=${LIST#,}" >> "$GITHUB_OUTPUT"
-          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
-          echo "Job ID: $JOB_ID"
-          echo "Engines: ${LIST#,}"
-          echo "Commit: ${COMMIT:-branch head}"
+          echo "::add-mask::$TICKET"
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_AUDIENCE" | jq -r .value)
+          echo "::add-mask::$token"
+          body=$(jq -nc --arg j "$JOB_ID" --arg t "$TICKET" '{job_id: $j, ticket: $t}')
+          code=$(curl -sS -o plan.json -w '%{http_code}' -X POST "$TRUSTSCAN_API/api/engine/redeem" \
+                   -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -d "$body")
+          if [ "$code" != 200 ]; then
+            echo "::error::$(jq -r '.detail // "TrustScan did not approve this run."' plan.json 2>/dev/null || echo 'TrustScan could not be reached.')"
+            exit 1
+          fi
+          engines=$(jq -r '.engines | join(",")' plan.json)
+          commit=$(jq -r '.commit' plan.json)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::TrustScan's plan has no commit"; exit 1; }
+          has() { [[ ",$engines," == *",$1,"* ]] && echo true || echo false; }
+          {
+            echo "engines=$engines"
+            echo "in_image=$(jq -r '[.engines[] | select(test("^ts-e[134567]$"))] | join(",")' plan.json)"
+            echo "ts_e2=$(has ts-e2)"
+            echo "dep_resolve=$(has dep-resolve)"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+          echo "Approved. Engines: $engines. Commit: $commit."
+
+  # ── The engines ─────────────────────────────────────
+  scan:
+    name: Scan
+    needs: gate
+    if: needs.gate.outputs.in_image != '' || needs.gate.outputs.ts_e2 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.gate.outputs.commit }}
+          path: src
+          persist-credentials: false
+
+      - name: Install signature verifier
+        if: env.IMAGE_PUBLIC_KEY != ''
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Engine image
+        env:
+          TAG: ${{ inputs.engine_tag }}
+        run: |
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad image tag"; exit 1; }
+          # Pulled, pinned to the digest that was pulled, and (when a key is
+          # set) verified before anything in it runs.
+          docker pull -q "$REG/trustscan-engine:$TAG" >/dev/null
+          ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$REG/trustscan-engine:$TAG")
+          [[ "$ref" == "$REG/trustscan-engine@sha256:"* ]] || { echo "::error::no digest for the engine image"; exit 1; }
+          if [ -n "$IMAGE_PUBLIC_KEY" ]; then
+            printf '%s\n' "$IMAGE_PUBLIC_KEY" > "$RUNNER_TEMP/image.pub"
+            cosign verify --key "$RUNNER_TEMP/image.pub" "$ref" >/dev/null 2>&1 \
+              || { echo "::error::The engine image's signature could not be verified; it was not run."; exit 1; }
+            echo "Engine image signature verified."
+          fi
+          echo "ENGINE=$ref" >> "$GITHUB_ENV"
+
+      - name: Analyse
+        env:
+          TICKET: ${{ inputs.ticket }}
+          IN_IMAGE: ${{ needs.gate.outputs.in_image }}
+          TS_E2: ${{ needs.gate.outputs.ts_e2 }}
+        run: |
+          echo "::add-mask::$TICKET"
+          mkdir -p out
+          # The key for this image's payload, from TrustScan, for this run
+          # only. It stays in this step's memory and reaches the image on stdin.
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                    "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_AUDIENCE" | jq -r .value)
+          echo "::add-mask::$token"
+          payload=$(docker run --rm "$ENGINE" id)
+          body=$(jq -nc --arg j "$JOB_ID" --arg t "$TICKET" --arg p "$payload" '{job_id: $j, ticket: $t, payload_id: $p}')
+          key=$(curl -sSf -X POST "$TRUSTSCAN_API/api/engine/redeem" -H "Authorization: Bearer $token" \
+                  -H 'Content-Type: application/json' -d "$body" | jq -r '.key // empty' || true)
+          [ -n "$key" ] || { echo "::error::TrustScan did not release the engine for this run."; exit 1; }
+          echo "::add-mask::$key"
+          if [ -n "$IN_IMAGE" ]; then
+            jq -nc --arg k "$key" --arg e "$IN_IMAGE" '{key: $k, engines: ($e | split(","))}' \
+              | docker run -i --rm -v "$PWD/src:/src:ro" -v "$PWD/out:/out" "$ENGINE" run
+          fi
+          if [ "$TS_E2" = true ]; then
+            jq -nc --arg k "$key" '{key: $k}' | docker run -i --rm "$ENGINE" script ts-e2 > "$RUNNER_TEMP/ts-e2.sh"
+            bash "$RUNNER_TEMP/ts-e2.sh" "$PWD/src" "$PWD/out" "$ENGINE"
+            rm -f "$RUNNER_TEMP/ts-e2.sh"
+          fi
+          unset key token
+
+      # One artifact per engine, named by engine id: TrustScan reads each one.
+      - { name: Upload ts-e1, if: hashFiles('out/ts-e1.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e1-results-${{ env.JOB_ID }}", path: out/ts-e1.sealed } }
+      - { name: Upload ts-e2, if: hashFiles('out/ts-e2.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e2-results-${{ env.JOB_ID }}", path: out/ts-e2.sealed } }
+      - { name: Upload ts-e3, if: hashFiles('out/ts-e3.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e3-results-${{ env.JOB_ID }}", path: out/ts-e3.sealed } }
+      - { name: Upload ts-e4, if: hashFiles('out/ts-e4.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e4-results-${{ env.JOB_ID }}", path: out/ts-e4.sealed } }
+      - { name: Upload ts-e5, if: hashFiles('out/ts-e5.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e5-results-${{ env.JOB_ID }}", path: out/ts-e5.sealed } }
+      - { name: Upload ts-e6, if: hashFiles('out/ts-e6.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e6-sbom-${{ env.JOB_ID }}", path: out/ts-e6.sealed } }
+      - { name: Upload ts-e7, if: hashFiles('out/ts-e7.sealed') != '', uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9, with: { name: "ts-e7-results-${{ env.JOB_ID }}", path: out/ts-e7.sealed } }
 
   # ── Dependency resolution for supply chain analysis ─
-  # The repository's own runner is the build sandbox: the resolver may run the
-  # project's build code here (Gradle, setup.py, source-only packages), with no
-  # token and no network but the package registries (resolver/ci/run.sh, shipped
-  # in the image). The platform reads dep-resolution-<job_id>.
+  # It may run the project's own build code (Gradle, setup.py, source-only
+  # packages), so it is a job of its own, never given the engine's key, with
+  # no token and no network but the package registries (the resolver's run.sh).
   dep-resolve:
     name: Dependency resolution
-    needs: setup
-    if: needs.setup.outputs.dep_resolve == 'true'
+    needs: gate
+    if: needs.gate.outputs.dep_resolve == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
       contents: read
     env:
-      REG: ${{ inputs.resolver_registry }}
       TAG: ${{ inputs.resolver_tag }}
+      ENGINE_TAG: ${{ inputs.engine_tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ needs.setup.outputs.commit }}
+          ref: ${{ needs.gate.outputs.commit }}
           path: src
           persist-credentials: false
 
+      - name: Install signature verifier
+        if: env.IMAGE_PUBLIC_KEY != ''
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
       - name: Resolve
         run: |
-          [[ "$REG" =~ ^[a-z0-9./_-]+$ && "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad image reference"; exit 1; }
-          export RESOLVER_IMAGE=$REG/trustscan-dep-resolver:$TAG RESOLVER_BUILD_IMAGE=$REG/trustscan-dep-resolver-build:$TAG
-          export EGRESS_IMAGE=$REG/trustscan-resolver-egress:$TAG EGRESS_BUILD_IMAGE=$REG/trustscan-resolver-egress-build:$TAG
-          for i in "$RESOLVER_IMAGE" "$RESOLVER_BUILD_IMAGE" "$EGRESS_IMAGE" "$EGRESS_BUILD_IMAGE"; do docker pull -q "$i"; done
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ && "$ENGINE_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad image tag"; exit 1; }
+          if [ -n "$IMAGE_PUBLIC_KEY" ]; then printf '%s\n' "$IMAGE_PUBLIC_KEY" > "$RUNNER_TEMP/image.pub"; fi
+          # Each image is pulled, pinned to the digest that was pulled, and
+          # (when a key is set) verified before anything in it runs.
+          pinned() {
+            docker pull -q "$REG/$1:$2" >/dev/null
+            local ref
+            ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$REG/$1:$2")
+            [[ "$ref" == "$REG/$1@sha256:"* ]] || { echo "::error::no digest for $1" >&2; exit 1; }
+            if [ -n "$IMAGE_PUBLIC_KEY" ]; then
+              cosign verify --key "$RUNNER_TEMP/image.pub" "$ref" >/dev/null 2>&1 \
+                || { echo "::error::The signature of $1 could not be verified; it was not run." >&2; exit 1; }
+            fi
+            echo "$ref"
+          }
+          RESOLVER_IMAGE=$(pinned trustscan-dep-resolver "$TAG")
+          RESOLVER_BUILD_IMAGE=$(pinned trustscan-dep-resolver-build "$TAG")
+          EGRESS_IMAGE=$(pinned trustscan-resolver-egress "$TAG")
+          EGRESS_BUILD_IMAGE=$(pinned trustscan-resolver-egress-build "$TAG")
+          ENGINE=$(pinned trustscan-engine "$ENGINE_TAG")
+          export RESOLVER_IMAGE RESOLVER_BUILD_IMAGE EGRESS_IMAGE EGRESS_BUILD_IMAGE
           docker run --rm --entrypoint cat "$RESOLVER_IMAGE" /opt/resolver/ci/run.sh > run.sh
           bash run.sh src out --build-mode
+          # Sealed for TrustScan, like every other result.
+          mkdir -p sealed
+          docker run --rm -v "$PWD/out:/in:ro" -v "$PWD/sealed:/sealed" "$ENGINE" \
+            seal dep-resolve /sealed /in/resolved-deps.json /in/meta.json
 
       - name: Upload results
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: dep-resolution-${{ env.JOB_ID }}
-          path: |
-            out/resolved-deps.json
-            out/meta.json
+          path: sealed/dep-resolve.sealed
           retention-days: 7
 
-  # ── ts-e1: static code analysis ─────────────────────
-  ts-e1:
-    name: Static code analysis (ts-e1)
-    needs: setup
-    if: needs.setup.outputs.ts_e1 == 'true'
-    runs-on: ubuntu-latest
-    container:
-      image: semgrep/semgrep:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          path: src
-          persist-credentials: false
-
-      - name: Fetch TrustScan rules
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          repository: ${{ inputs.engine_repository }}
-          ref: ${{ inputs.engine_ref }}
-          sparse-checkout: |
-            rules/semgrep
-            rules/semgrep-open
-          path: trustscan
-          persist-credentials: false
-
-      - name: Analyse
-        run: |
-          RULES="$GITHUB_WORKSPACE/trustscan/rules"
-          OUT="$GITHUB_WORKSPACE/ts-e1.json"
-          if [ ! -d "$RULES/semgrep" ] || [ ! -d "$RULES/semgrep-open" ]; then
-            echo "::error::TrustScan's rules are missing from the engine repository"
-            exit 1
-          fi
-          cd src
-          # Generated docs and bundled third-party code are left out: on 14
-          # real apps they were 245 of 1,913 findings, none in the app's code.
-          if ! semgrep scan \
-              --config "$RULES/semgrep" --config "$RULES/semgrep-open" \
-              --dataflow-traces --metrics=off --disable-version-check \
-              --exclude=docs --exclude=doc \
-              --exclude='*.min.js' --exclude='*.bundle.js' \
-              --exclude='**/static/**/libs/**' --exclude='**/static/**/vendor/**' \
-              --exclude=vendor --exclude=third_party --exclude=node_modules \
-              --json --output "$OUT" . >/dev/null 2>"$GITHUB_WORKSPACE/engine.log"; then
-            echo "::warning::ts-e1 reported an error; partial results kept"
-          fi
-          [ -s "$OUT" ] || echo '{"results":[],"errors":[]}' > "$OUT"
-          echo "ts-e1 finished"
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e1-results-${{ env.JOB_ID }}
-          path: ts-e1.json
-
-  # ── ts-e3: secret detection ─────────────────────────
-  ts-e3:
-    name: Secret detection (ts-e3)
-    needs: setup
-    if: needs.setup.outputs.ts_e3 == 'true'
-    runs-on: ubuntu-latest
-    container:
-      image: zricethezav/gitleaks:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          persist-credentials: false
-
-      - name: Analyse
-        run: |
-          gitleaks detect --source=. --report-path=ts-e3.json --report-format=json --no-git \
-            --exit-code 0 >/dev/null 2>&1 || true
-          [ -s ts-e3.json ] || echo '[]' > ts-e3.json
-          echo "ts-e3 finished"
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e3-results-${{ env.JOB_ID }}
-          path: ts-e3.json
-
-  # ── ts-e4: dependency and configuration analysis ────
-  ts-e4:
-    name: Dependency and configuration analysis (ts-e4)
-    needs: setup
-    if: needs.setup.outputs.ts_e4 == 'true'
-    runs-on: ubuntu-latest
-    container:
-      image: aquasec/trivy:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          persist-credentials: false
-
-      - name: Analyse
-        run: |
-          trivy fs --quiet --scanners vuln,secret,misconfig --format json --output ts-e4.json . >/dev/null 2>&1 || true
-          [ -s ts-e4.json ] || echo '{"Results":[]}' > ts-e4.json
-          echo "ts-e4 finished"
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e4-results-${{ env.JOB_ID }}
-          path: ts-e4.json
-
-  # ── ts-e5: advisory matching ────────────────────────
-  ts-e5:
-    name: Advisory matching (ts-e5)
-    needs: setup
-    if: needs.setup.outputs.ts_e5 == 'true'
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/google/osv-scanner:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          persist-credentials: false
-
-      - name: Analyse
-        run: |
-          # JSON goes to --output, never through a shell redirect: progress
-          # lines on stderr would end up inside the JSON.
-          /osv-scanner --format json --output ts-e5.json -r . >/dev/null 2>&1 || true
-          # The image has no jq or python: check the file starts as an object.
-          if [ ! -s ts-e5.json ] || [ "$(head -c 1 ts-e5.json)" != "{" ]; then
-            echo '{"results":[]}' > ts-e5.json
-          fi
-          echo "ts-e5 finished"
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e5-results-${{ env.JOB_ID }}
-          path: ts-e5.json
-
-  # ── ts-e6: component inventory ──────────────────────
-  ts-e6:
-    name: Component inventory (ts-e6)
-    needs: setup
-    if: needs.setup.outputs.ts_e6 == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          persist-credentials: false
-
-      - name: Analyse
-        run: |
-          docker run --rm -v "$PWD:/src" anchore/syft:latest /src -q -o json > ts-e6.json 2>/dev/null || true
-          [ -s ts-e6.json ] || echo '{"artifacts":[]}' > ts-e6.json
-          echo "ts-e6 finished"
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e6-sbom-${{ env.JOB_ID }}
-          path: ts-e6.json
-
-  # ── ts-e7: attack surface mapping ───────────────────
-  ts-e7:
-    name: Attack surface mapping (ts-e7)
-    needs: setup
-    if: needs.setup.outputs.ts_e7 == 'true'
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/owasp-noir/noir:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          persist-credentials: false
-
-      - name: Analyse
-        run: |
-          noir -b . -o ts-e7.json --format json --passive-scan >/dev/null 2>&1 || true
-          [ -s ts-e7.json ] || echo '{"endpoints":[],"url":"","method":""}' > ts-e7.json
-          echo "ts-e7 finished"
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e7-results-${{ env.JOB_ID }}
-          path: ts-e7.json
-
-  # ── ts-e2: deep dataflow analysis ───────────────────
-  # Requested by the platform only for a public repository, or a private one
-  # whose owner has GitHub Advanced Security (backend core/codeql_licence.py).
-  ts-e2:
-    name: Deep dataflow analysis (ts-e2)
-    needs: setup
-    if: needs.setup.outputs.ts_e2 == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-      contents: read
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ needs.setup.outputs.commit }}
-          persist-credentials: false
-
-      - name: Detect languages
-        id: detect-languages
-        run: |
-          LANGS=""
-          if find . -name "*.py" -type f | head -1 | grep -q .; then LANGS="$LANGS,python"; fi
-          if find . \( -name "*.js" -o -name "*.ts" \) -type f | head -1 | grep -q .; then LANGS="$LANGS,javascript"; fi
-          if find . -name "*.java" -type f | head -1 | grep -q .; then LANGS="$LANGS,java"; fi
-          if find . -name "*.go" -type f | head -1 | grep -q .; then LANGS="$LANGS,go"; fi
-          if find . -name "*.rb" -type f | head -1 | grep -q .; then LANGS="$LANGS,ruby"; fi
-          LANGS="${LANGS#,}"
-          if [ -z "$LANGS" ]; then LANGS="javascript"; fi
-          echo "languages=$LANGS" >> $GITHUB_OUTPUT
-
-      - name: Prepare
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
-        with:
-          languages: ${{ steps.detect-languages.outputs.languages }}
-        continue-on-error: true
-
-      - name: Build
-        uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
-        continue-on-error: true
-
-      - name: Analyse
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4
-        with:
-          output: ts-e2
-        continue-on-error: true
-
-      - name: Ensure results exist
-        run: |
-          mkdir -p ts-e2
-          if [ ! "$(ls -A ts-e2 2>/dev/null)" ]; then
-            echo '{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"ts-e2"}},"results":[]}]}' > ts-e2/results.sarif
-          fi
-
-      - name: Upload results
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: ts-e2-results-${{ env.JOB_ID }}
-          path: ts-e2
-
   # ── Summary ─────────────────────────────────────────
-  collect-results:
+  summary:
     name: Scan summary
-    needs: [setup, ts-e1, ts-e2, ts-e3, ts-e4, ts-e5, ts-e6, ts-e7]
+    needs: [gate, scan, dep-resolve]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Download results
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          path: ./all-results
-          pattern: '*-${{ env.JOB_ID }}'
-          merge-multiple: false
-
       - name: Create summary
         env:
-          ENGINES: ${{ needs.setup.outputs.engines }}
+          ENGINES: ${{ needs.gate.outputs.engines }}
+          GATE: ${{ needs.gate.result }}
+          SCAN: ${{ needs.scan.result }}
         run: |
           {
-            echo "## 🔐 TrustScan Security Scan Summary"
+            echo "## 🔐 TrustScan Security Scan"
             echo ""
             echo "**Job ID:** ${JOB_ID}"
-            echo "**Engines:** ${ENGINES}"
-            echo ""
-            echo "### Results"
-            for dir in ./all-results/*/; do
-              [ -d "$dir" ] && echo "- ✅ $(basename "$dir")"
-            done
-            echo ""
-            echo "Results are sent to TrustScan; open the scan in the dashboard."
+            if [ "$GATE" != success ]; then
+              echo ""
+              echo "This run was not approved by TrustScan. Start scans from the TrustScan dashboard."
+            else
+              echo "**Engines:** ${ENGINES}"
+              echo ""
+              echo "Scan: ${SCAN}. Results are sealed for TrustScan; open the scan in the dashboard."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
